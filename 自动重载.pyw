@@ -425,18 +425,22 @@ class App:
             image = Image.new("RGB", (64, 64), "#2f6fed")
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示", lambda icon, item: self.show_main_window()),
+            pystray.MenuItem("显示", lambda icon, item: self.show_main_window(), default=True),
             pystray.MenuItem("退出", lambda icon, item: self.exit_app()),
         )
         self.tray_icon = pystray.Icon("M2ServerReload", image, "M2Server 重载管理", menu)
         self.tray_icon.run()
 
     def show_main_window(self):
-        self.root.after(0, self._show_main_window)
+        if self.root.winfo_exists():
+            self.root.after(0, self._show_main_window)
 
     def _show_main_window(self):
         self.root.deiconify()
+        self.root.state("normal")
         self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(100, lambda: self.root.attributes("-topmost", False))
         self.root.focus_force()
 
     def show_tray_menu(self):
