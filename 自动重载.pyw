@@ -15,8 +15,9 @@ from PIL import Image
 import ctypes
 from ctypes import wintypes
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-TRAY_ICON_PATH = r"D:\源码\1.ico"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+TRAY_ICON_PATH = os.path.join(BASE_DIR, "icon.ico")
 VK_CONTROL = 0x11
 VK_S = 0x53
 WM_TRAYICON = win32con.WM_USER + 20
