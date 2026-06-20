@@ -98,6 +98,8 @@ class App:
         cfg = load_config()
         self.cfg_font = cfg.get("font_name", "Segoe UI")
         self.cfg_size = cfg.get("font_size", "22")
+        self._font_cache = {}
+        self._auto_font_after_id = None
 
         self.root = tk.Tk()
         self.root.title("M2Server 重载管理")
@@ -110,6 +112,7 @@ class App:
         self.load_data()
         self.start_polling()
         self.start_tray_icon()
+        self._start_auto_font()
 
         self.root.mainloop()
 
@@ -163,6 +166,11 @@ class App:
 
         ttk.Button(row1, text="修改字体", command=self.apply_font).pack(side="left", padx=5)
 
+        row2 = ttk.Frame(font_frame)
+        row2.pack(fill="x", pady=(5, 0))
+        self.auto_font_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="每秒自动枚举窗口并应用字体", variable=self.auto_font_var, command=self._on_auto_font_toggle).pack(side="left")
+
         # 状态栏
         self.status_var = tk.StringVar(value="就绪，等待 Ctrl+S...")
         ttk.Label(
@@ -187,46 +195,95 @@ class App:
             self.status_var.set("未连接到 M2Server，请先刷新")
             return
 
-        # 查找TMemo
-        target_memo = None
-        def find_memo(hwnd):
-            nonlocal target_memo
-            if win32gui.GetClassName(hwnd) == "TMemo":
-                target_memo = hwnd
-                return False
-            def cb(c, _):
-                find_memo(c)
-                return True
-            win32gui.EnumChildWindows(hwnd, cb, None)
-
-        find_memo(self.m2_hwnd)
+        target_memo = self._find_memo(self.m2_hwnd)
         if not target_memo:
             self.status_var.set("未找到日志编辑器(TMemo)")
             return
 
-        # 创建字体并应用
-        gdi32 = ctypes.windll.gdi32
-        user32 = ctypes.windll.user32
-        gdi32.CreateFontIndirectW.argtypes = [ctypes.POINTER(LOGFONTW)]
-        gdi32.CreateFontIndirectW.restype = wintypes.HANDLE
-        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-        user32.SendMessageW.restype = ctypes.c_long
-        user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
-        user32.InvalidateRect.restype = wintypes.BOOL
-
-        lf = LOGFONTW()
-        lf.lfHeight = -font_size
-        lf.lfCharSet = 134
-        lf.lfFaceName = font_name
-        hfont = gdi32.CreateFontIndirectW(ctypes.byref(lf))
-        if hfont:
-            user32.SendMessageW(target_memo, 0x0030, hfont, 1)
-            user32.InvalidateRect(target_memo, None, True)
+        if self._do_apply_font(target_memo, font_name, font_size):
             save_config({"font_name": font_name, "font_size": font_size})
             self.cfg_font, self.cfg_size = font_name, str(font_size)
             self.status_var.set(f"字体已更新: {font_name} {font_size}")
         else:
             self.status_var.set("创建字体失败")
+
+    def _find_memo(self, parent_hwnd):
+        target_memo = None
+        def find(hwnd):
+            nonlocal target_memo
+            if win32gui.GetClassName(hwnd) == "TMemo":
+                target_memo = hwnd
+                return False
+            def cb(c, _):
+                find(c)
+                return True
+            win32gui.EnumChildWindows(hwnd, cb, None)
+        find(parent_hwnd)
+        return target_memo
+
+    def _do_apply_font(self, memo_hwnd, font_name, font_size):
+        lf = LOGFONTW()
+        lf.lfHeight = -font_size
+        lf.lfCharSet = 134
+        lf.lfFaceName = font_name
+        hfont = ctypes.windll.gdi32.CreateFontIndirectW(ctypes.byref(lf))
+        if hfont:
+            ctypes.windll.user32.SendMessageW(memo_hwnd, 0x0030, hfont, 1)
+            ctypes.windll.user32.InvalidateRect(memo_hwnd, None, True)
+            return True
+        return False
+
+    def _start_auto_font(self):
+        self._auto_font_tick()
+
+    def _auto_font_tick(self):
+        if not self.auto_font_var.get():
+            self._auto_font_after_id = self.root.after(1000, self._auto_font_tick)
+            return
+
+        font_name = self.cfg_font
+        try:
+            font_size = int(self.cfg_size)
+        except:
+            self._auto_font_after_id = self.root.after(1000, self._auto_font_tick)
+            return
+
+        hwnds = []
+        def enum_cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title and "996引擎" in title and "KUAFU" in title:
+                    hwnds.append(hwnd)
+            return True
+        win32gui.EnumWindows(enum_cb, None)
+
+        applied = 0
+        for hwnd in hwnds:
+            memo = self._find_memo(hwnd)
+            if not memo:
+                continue
+            cache_key = (hwnd, font_name, font_size)
+            if self._font_cache.get(hwnd) == cache_key:
+                continue
+            if self._do_apply_font(memo, font_name, font_size):
+                self._font_cache[hwnd] = cache_key
+                applied += 1
+
+        stale = [h for h in self._font_cache if not win32gui.IsWindow(h)]
+        for h in stale:
+            del self._font_cache[h]
+
+        if applied:
+            self.status_var.set(f"自动字体: 已应用 {applied} 个窗口")
+
+        self._auto_font_after_id = self.root.after(1000, self._auto_font_tick)
+
+    def _on_auto_font_toggle(self):
+        if self.auto_font_var.get():
+            self._font_cache.clear()
+            self.status_var.set("自动字体设置已开启")
+        else:
+            self.status_var.set("自动字体设置已关闭")
 
     def _save_selected(self):
         selected = [t for t, v in self.check_vars.items() if v.get()]
@@ -473,6 +530,9 @@ class App:
         self.poll_running = False
         self.running = False
         self.tray_running = False
+        if self._auto_font_after_id:
+            self.root.after_cancel(self._auto_font_after_id)
+            self._auto_font_after_id = None
         self.remove_tray_icon()
         if self.tray_hwnd:
             try:
