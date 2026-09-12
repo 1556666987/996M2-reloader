@@ -1,4 +1,14 @@
 {
   "font_name": "Segoe UI",
-  "font_size": 22
+  "font_size": 22,
+  "selected_items": [
+    "物品数据(&I)",
+    "怪物数据(&K)",
+    "重载爆率(&O)",
+    "参数设置(&V)",
+    "&QFunction\tCtrl+F",
+    "LuaFunc函数库(&L)\tCtrl+L",
+    "LuaCond条件函数库(&U)\tCtrl+K",
+    "所有NPC(&N)\tCtrl+N"
+  ]
 }

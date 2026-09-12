@@ -11,7 +11,8 @@
 | `pywin32` | Windows API 封装（窗口枚举、热键注册、消息投递） |
 | `pywinauto` | 菜单结构遍历与子项识别 |
 | `psutil` | 进程名获取与验证 |
-| `ctypes` | 低层 Windows API 调用（消息循环） |
+| `ctypes` | 低层 Windows API 调用（按键轮询、字体设置） |
+| `pystray` / `Pillow` | 系统托盘图标和资源 |
 
 ## 开发历程
 
@@ -52,22 +53,19 @@ GetMenu → GetMenuItemCount → sub_menu() → items() → item.text()
 - 导致打字明显卡顿
 - 已弃用
 
-**第二版 — RegisterHotKey（最终方案）**
-- Windows 内核级热键，仅在 `Ctrl+S` 按下时触发
-- 不影响正常键盘输入，无延迟
-- **真正全局**：在任何应用中按下 `Ctrl+S` 均有效
+**当前实现 — GetAsyncKeyState 轮询**
+- 后台线程每 50ms 检查 `Ctrl+S` 组合键
+- 检测到按下沿后通过 Tk 主线程调度执行任务
 
 ## 最终架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                     main.py                          │
+│                  自动重载.pyw                         │
 │                                                      │
-│  RegisterHotKey(Ctrl+S)                              │
+│  GetAsyncKeyState(Ctrl+S) 轮询                       │
 │       ↓                                              │
-│  WM_HOTKEY → WndProc → PostMessage(WM_TRIGGER_TASK)  │
-│       ↓                                              │
-│  WM_TRIGGER_TASK → process_ctrl_s()                  │
+│  Tk after → execute_checked()                        │
 │       ↓                                              │
 │  ┌─ EnumWindows (查找 996引擎+KUAFU 窗口)           │
 │  ├─ psutil (验证 M2Server.exe)                       │
@@ -80,17 +78,17 @@ GetMenu → GetMenuItemCount → sub_menu() → items() → item.text()
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | 主程序（最终版） |
+| `自动重载.pyw` | 主程序（最终版） |
 
 ## 运行说明
 
 1. 确保依赖已安装：
    ```cmd
-   pip install pywin32 pywinauto psutil
+   pip install pywin32 pywinauto psutil pystray pillow
    ```
 2. 运行：
    ```cmd
-   python main.py
+   python 自动重载.pyw
    ```
 3. 在任意应用中按 `Ctrl+S` 触发
 4. 按 `Ctrl+C` 退出程序
@@ -116,3 +114,4 @@ GetMenu → GetMenuItemCount → sub_menu() → items() → item.text()
 - 热键 `Ctrl+S` 可能被其他程序占用，此时程序会提示并仅执行一次初始任务
 - 程序运行后保持后台消息循环，不会自动退出
 - 执行菜单项通过 `SendMessage/PostMessage` 直接投递命令，不模拟鼠标点击
+- 面板支持记录/清除 M2Server 与客户端控制台窗口布局；启动和 Ctrl+S 执行前自动恢复布局，并对经典控制台按客户区/字体单元格同步字符缓冲区、水平视口及异步重绘

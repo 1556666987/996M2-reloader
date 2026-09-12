@@ -1,12 +1,16 @@
 import tkinter as tk
 from tkinter import ttk
+from tkinter import messagebox
 import threading
 import time
 import json
 import os
+import sys
+import win32api
 import win32gui
 import win32process
 import win32con
+import pywintypes
 import psutil
 import pywinauto
 from pywinauto.application import Application
@@ -15,15 +19,43 @@ from PIL import Image
 import ctypes
 from ctypes import wintypes
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-TRAY_ICON_PATH = os.path.join(BASE_DIR, "icon.ico")
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+    RESOURCE_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    RESOURCE_DIR = APP_DIR
+
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+TRAY_ICON_PATH = os.path.join(RESOURCE_DIR, "icon.ico")
 VK_CONTROL = 0x11
 VK_S = 0x53
+CTRL_S_TRIGGER_DELAY_MS = 500
 WM_TRAYICON = win32con.WM_USER + 20
 TRAY_UID = 1
 ID_TRAY_SHOW = 1000
 ID_TRAY_EXIT = 1001
+
+# 未设置自定义记录时使用的默认布局。坐标使用 Windows 虚拟桌面坐标，
+# 当前机器上 DISPLAY2 位于主屏左侧，因此 X 坐标为负数。
+DEFAULT_WINDOW_LAYOUT = {
+    "m2server": {
+        "screen": r"\\.\DISPLAY2",
+        "x": -760,
+        "y": 5,
+        "width": 754,
+        "height": 516,
+    },
+    "client_console": {
+        "screen": r"\\.\DISPLAY2",
+        "x": -765,
+        "y": 517,
+        "width": 759,
+        "height": 519,
+    },
+}
+CLIENT_CONSOLE_TITLE = r"E:\龙龙火龙七改\client\game.exe"
+CLIENT_CONSOLE_EXE = os.path.normcase(os.path.normpath(CLIENT_CONSOLE_TITLE))
 _app = None
 
 def tray_wnd_proc(hwnd, msg, wparam, lparam):
@@ -72,8 +104,9 @@ def save_config(cfg):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
     except:
-        pass
+        return False
 
 FONTS = [
     "Consolas", "Lucida Console", "Tahoma",
@@ -102,7 +135,7 @@ class App:
         self._auto_font_after_id = None
 
         self.root = tk.Tk()
-        self.root.title("M2Server 重载管理")
+        self.root.title("M2Server 重载管理 By:老刀 QQ:1556666987")
         self.root.geometry("480x580")
         self.root.resizable(False, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -113,6 +146,8 @@ class App:
         self.start_polling()
         self.start_tray_icon()
         self._start_auto_font()
+        # 启动时立即恢复窗口布局；Ctrl+S 时还会再次恢复，适配目标程序重启或移动。
+        self.root.after(100, self._restore_window_layout)
 
         self.root.mainloop()
 
@@ -129,6 +164,12 @@ class App:
         ttk.Button(btn_frame, text="取消全选", command=self.deselect_all, width=10).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="退出", command=self.exit_app, width=8).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="刷新", command=self.refresh, width=8).pack(side="right", padx=2)
+
+        layout_frame = ttk.Frame(self.root)
+        layout_frame.pack(fill="x", padx=10, pady=(0, 5))
+        ttk.Button(layout_frame, text="记录窗口", command=self.record_windows, width=10).pack(side="left", padx=2)
+        ttk.Button(layout_frame, text="清除记录", command=self.clear_window_record, width=10).pack(side="left", padx=2)
+        ttk.Label(layout_frame, text="Ctrl+S 时自动恢复窗口布局").pack(side="left", padx=(10, 2))
 
         container = ttk.Frame(self.root)
         container.pack(fill="both", expand=True, padx=10, pady=5)
@@ -201,7 +242,10 @@ class App:
             return
 
         if self._do_apply_font(target_memo, font_name, font_size):
-            save_config({"font_name": font_name, "font_size": font_size})
+            cfg = load_config()
+            cfg["font_name"] = font_name
+            cfg["font_size"] = font_size
+            save_config(cfg)
             self.cfg_font, self.cfg_size = font_name, str(font_size)
             self.status_var.set(f"字体已更新: {font_name} {font_size}")
         else:
@@ -307,6 +351,352 @@ class App:
     def refresh(self):
         self.load_data()
 
+    @staticmethod
+    def _copy_default_layout():
+        return {
+            key: value.copy()
+            for key, value in DEFAULT_WINDOW_LAYOUT.items()
+        }
+
+    def _process_matches(self, hwnd, expected_name, expected_path=None):
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            process = psutil.Process(pid)
+            if process.name().lower() != expected_name.lower():
+                return False
+            if expected_path:
+                try:
+                    actual_path = os.path.normcase(os.path.normpath(process.exe()))
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    actual_path = ""
+                if actual_path and actual_path != expected_path:
+                    return False
+            return True
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            return False
+
+    def _find_target_windows(self, require_visible=True):
+        targets = {"m2server": None, "client_console": None}
+
+        def enum_cb(hwnd, _):
+            try:
+                # 记录模式跳过隐藏/最小化窗口，避免把 -32000 坐标写入配置；恢复
+                # 模式允许找到最小化窗口，再先恢复其正常状态后设置布局。
+                if not win32gui.IsWindow(hwnd):
+                    return True
+                if require_visible and (not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd)):
+                    return True
+                title = win32gui.GetWindowText(hwnd)
+                if not title:
+                    return True
+
+                if (
+                    targets["m2server"] is None
+                    and "996引擎" in title
+                    and "KUAFU" in title
+                    and self._process_matches(hwnd, "M2Server.exe")
+                ):
+                    targets["m2server"] = hwnd
+
+                if (
+                    targets["client_console"] is None
+                    and title == CLIENT_CONSOLE_TITLE
+                    and self._process_matches(hwnd, "game.exe", CLIENT_CONSOLE_EXE)
+                ):
+                    targets["client_console"] = hwnd
+            except Exception:
+                return True
+            return targets["m2server"] is None or targets["client_console"] is None
+
+        try:
+            win32gui.EnumWindows(enum_cb, None)
+        except pywintypes.error:
+            # 窗口在枚举期间被关闭时，EnumWindows 可能返回系统错误；保留
+            # 已经找到的句柄，由调用方决定是否继续或提示缺失。
+            pass
+        return targets
+
+    @staticmethod
+    def _window_layout_info(hwnd):
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+        monitor_info = win32api.GetMonitorInfo(monitor)
+        return {
+            "screen": monitor_info.get("Device", ""),
+            "x": int(left),
+            "y": int(top),
+            "width": int(right - left),
+            "height": int(bottom - top),
+        }
+
+    @staticmethod
+    def _monitor_work_area(device_name):
+        for monitor_handle, _, _ in win32api.EnumDisplayMonitors():
+            info = win32api.GetMonitorInfo(monitor_handle)
+            if info.get("Device") == device_name:
+                return info.get("Work", info.get("Monitor"))
+        return None
+
+    @staticmethod
+    def _sync_console_buffer(hwnd, client_width, client_height):
+        """Synchronize a classic console buffer with its resized pixel viewport."""
+        if win32gui.GetClassName(hwnd) != "ConsoleWindowClass":
+            return
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetConsoleWindow.restype = wintypes.HWND
+        # The GUI app normally has no console of its own. Avoid stealing an
+        # interactive console when the script is launched from a terminal.
+        if kernel32.GetConsoleWindow():
+            return
+
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if not kernel32.AttachConsole(pid):
+            return
+
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class SMALL_RECT(ctypes.Structure):
+            _fields_ = [
+                ("Left", wintypes.SHORT),
+                ("Top", wintypes.SHORT),
+                ("Right", wintypes.SHORT),
+                ("Bottom", wintypes.SHORT),
+            ]
+
+        class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", COORD),
+                ("dwCursorPosition", COORD),
+                ("wAttributes", wintypes.WORD),
+                ("srWindow", SMALL_RECT),
+                ("dwMaximumWindowSize", COORD),
+            ]
+
+        class CONSOLE_FONT_INFO(ctypes.Structure):
+            _fields_ = [("nFont", wintypes.DWORD), ("dwFontSize", COORD)]
+
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetConsoleScreenBufferInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO),
+        ]
+        kernel32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+        kernel32.SetConsoleWindowInfo.argtypes = [
+            wintypes.HANDLE,
+            wintypes.BOOL,
+            ctypes.POINTER(SMALL_RECT),
+        ]
+        kernel32.SetConsoleWindowInfo.restype = wintypes.BOOL
+        kernel32.SetConsoleScreenBufferSize.argtypes = [wintypes.HANDLE, COORD]
+        kernel32.SetConsoleScreenBufferSize.restype = wintypes.BOOL
+        kernel32.GetCurrentConsoleFont.argtypes = [
+            wintypes.HANDLE,
+            wintypes.BOOL,
+            ctypes.POINTER(CONSOLE_FONT_INFO),
+        ]
+        kernel32.GetCurrentConsoleFont.restype = wintypes.BOOL
+
+        handle = kernel32.CreateFileW(
+            "CONOUT$",
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            kernel32.FreeConsole()
+            return
+
+        try:
+            info = CONSOLE_SCREEN_BUFFER_INFO()
+            if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+                return
+
+            # Classic console dimensions are character-based. Use the active
+            # font metrics to convert the pixel client area into columns/rows.
+            font_info = CONSOLE_FONT_INFO()
+            if kernel32.GetCurrentConsoleFont(handle, False, ctypes.byref(font_info)):
+                cell_width = max(1, int(font_info.dwFontSize.X))
+                cell_height = max(1, int(font_info.dwFontSize.Y))
+            else:
+                cell_width, cell_height = 8, 16
+            columns = max(1, int(client_width / cell_width))
+            rows = max(1, int(client_height / cell_height))
+
+            # Do not use GetScrollInfo().nPage here. During a resize conhost
+            # can briefly report the previous (or a horizontally scrolled)
+            # viewport page. Treating that stale value as the target width can
+            # shrink the character buffer and make the whole console window
+            # narrower than the requested layout. The resized client area and
+            # current font metrics provide a stable target instead.
+            columns = min(columns, 32767)
+            rows = min(rows, 32767)
+
+            buffer_width = max(columns, int(info.dwCursorPosition.X) + 1)
+            buffer_height = max(int(info.dwSize.Y), int(info.srWindow.Top) + rows)
+            current_top = max(0, min(int(info.srWindow.Top), buffer_height - rows))
+
+            # A larger viewport needs a larger buffer first. When narrowing,
+            # the viewport must fit the existing buffer before the buffer can
+            # be reduced to the target width.
+            if buffer_width > int(info.dwSize.X) or buffer_height > int(info.dwSize.Y):
+                if not kernel32.SetConsoleScreenBufferSize(handle, COORD(buffer_width, buffer_height)):
+                    return
+            viewport = SMALL_RECT(0, current_top, columns - 1, current_top + rows - 1)
+            if not kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(viewport)):
+                return
+            if buffer_width < int(info.dwSize.X) or buffer_height < int(info.dwSize.Y):
+                kernel32.SetConsoleScreenBufferSize(handle, COORD(buffer_width, buffer_height))
+        finally:
+            kernel32.CloseHandle(handle)
+            kernel32.FreeConsole()
+
+    def _clamped_window_position(self, geometry):
+        width = max(1, int(geometry["width"]))
+        height = max(1, int(geometry["height"]))
+        x = int(geometry["x"])
+        y = int(geometry["y"])
+        work_area = self._monitor_work_area(geometry.get("screen", ""))
+        if work_area:
+            left, top, right, bottom = work_area
+            max_x = max(left, right - width)
+            max_y = max(top, bottom - height)
+            x = min(max(x, left), max_x)
+            y = min(max(y, top), max_y)
+        return x, y, width, height
+
+    def record_windows(self):
+        targets = self._find_target_windows()
+        missing = []
+        if not targets["m2server"]:
+            missing.append("M2Server 主窗口")
+        if not targets["client_console"]:
+            missing.append("客户端控制台窗口")
+        if missing:
+            messagebox.showwarning(
+                "无法记录窗口",
+                "以下窗口未找到，已中止记录：\n" + "、".join(missing),
+                parent=self.root,
+            )
+            self.status_var.set("记录窗口失败：两个目标窗口必须同时存在")
+            return
+
+        cfg = load_config()
+        cfg["window_layout"] = {
+            "m2server": self._window_layout_info(targets["m2server"]),
+            "client_console": self._window_layout_info(targets["client_console"]),
+        }
+        if save_config(cfg):
+            self.status_var.set("已记录 M2Server 和客户端控制台窗口布局")
+        else:
+            self.status_var.set("窗口布局保存失败，请检查配置文件权限")
+
+    def clear_window_record(self):
+        cfg = load_config()
+        if "window_layout" in cfg:
+            del cfg["window_layout"]
+        if save_config(cfg):
+            self.status_var.set("已清除自定义窗口布局，将使用默认布局")
+        else:
+            self.status_var.set("清除窗口布局失败，请检查配置文件权限")
+
+    def _active_window_layout(self):
+        layout = self._copy_default_layout()
+        custom = load_config().get("window_layout")
+        if not isinstance(custom, dict):
+            return layout
+        for key in layout:
+            value = custom.get(key)
+            if not isinstance(value, dict):
+                continue
+            for field in ("screen", "x", "y", "width", "height"):
+                if field in value:
+                    layout[key][field] = value[field]
+        return layout
+
+    def _restore_window_layout(self):
+        targets = self._find_target_windows(require_visible=False)
+        layout = self._active_window_layout()
+        restored = []
+        missing = []
+        for key, label in (("m2server", "M2Server"), ("client_console", "客户端控制台")):
+            hwnd = targets.get(key)
+            if not hwnd:
+                missing.append(label)
+                continue
+            geometry = layout[key]
+            try:
+                x, y, width, height = self._clamped_window_position(geometry)
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                elif not win32gui.IsWindowVisible(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+                win32gui.SetWindowPos(
+                    hwnd,
+                    0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
+                )
+                # WM_SIZE 的 lParam 要求客户区尺寸，而不是包含边框的外框尺寸。
+                # 手动拖动窗口时 Windows 也会按客户区尺寸发送该消息。
+                _, _, client_width, client_height = win32gui.GetClientRect(hwnd)
+                size_lparam = win32api.MAKELONG(client_width, client_height)
+                win32gui.SendMessage(hwnd, win32con.WM_SIZE, win32con.SIZE_RESTORED, size_lparam)
+                win32gui.InvalidateRect(hwnd, None, True)
+                win32gui.UpdateWindow(hwnd)
+                if win32gui.GetClassName(hwnd) == "ConsoleWindowClass":
+                    self._sync_console_buffer(hwnd, client_width, client_height)
+                    # conhost may recalculate its viewport asynchronously in
+                    # response to WM_SIZE. Repeat after that pass and repaint.
+                    self.root.after(100, self._resync_console_window, hwnd)
+                    self.root.after(300, self._resync_console_window, hwnd)
+                restored.append(label)
+            except (KeyError, TypeError, ValueError, OSError):
+                missing.append(label)
+
+        if missing:
+            self.status_var.set(
+                "窗口布局：已调整 " + ("、".join(restored) if restored else "无")
+                + "；未找到或调整失败：" + "、".join(missing)
+            )
+        elif restored:
+            self.status_var.set("窗口布局已恢复：" + "、".join(restored))
+        return targets
+
+    def _resync_console_window(self, hwnd):
+        if not win32gui.IsWindow(hwnd) or win32gui.GetClassName(hwnd) != "ConsoleWindowClass":
+            return
+        try:
+            _, _, client_width, client_height = win32gui.GetClientRect(hwnd)
+            self._sync_console_buffer(hwnd, client_width, client_height)
+            win32gui.InvalidateRect(hwnd, None, True)
+            win32gui.UpdateWindow(hwnd)
+        except (OSError, pywintypes.error):
+            pass
+
     def load_data(self):
         for w in self.items_frame.winfo_children():
             w.destroy()
@@ -345,20 +735,11 @@ class App:
             self.status_var.set(f"就绪，共 {len(items)} 项（已勾选 {cnt} 项），等待 Ctrl+S...")
 
     def _fetch_reload_items(self):
-        hwnds = []
-
-        def enum_cb(hwnd, hwnds):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if title and "996引擎" in title and "KUAFU" in title:
-                    hwnds.append(hwnd)
-            return True
-
-        win32gui.EnumWindows(enum_cb, hwnds)
-        if not hwnds:
+        target_hwnd = self._find_target_windows(require_visible=True).get("m2server")
+        if not target_hwnd:
             return []
 
-        self.m2_hwnd = hwnds[0]
+        self.m2_hwnd = target_hwnd
         _, pid = win32process.GetWindowThreadProcessId(self.m2_hwnd)
         try:
             pname = psutil.Process(pid).name()
@@ -402,23 +783,16 @@ class App:
                 now = time.time()
                 if now - self._last_trigger >= 1.0:
                     self._last_trigger = now
-                    self.root.after(0, self.execute_checked)
+                    self.root.after(CTRL_S_TRIGGER_DELAY_MS, self.execute_checked)
 
             self.ctrl_s_was_pressed = now_pressed
             time.sleep(0.05)
 
     def _refresh_connection(self):
-        hwnds = []
-        def enum_cb(hwnd, hwnds):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if title and "996引擎" in title and "KUAFU" in title:
-                    hwnds.append(hwnd)
-            return True
-        win32gui.EnumWindows(enum_cb, hwnds)
-        if not hwnds:
+        target_hwnd = self._find_target_windows(require_visible=True).get("m2server")
+        if not target_hwnd:
             return False
-        self.m2_hwnd = hwnds[0]
+        self.m2_hwnd = target_hwnd
         _, pid = win32process.GetWindowThreadProcessId(self.m2_hwnd)
         try:
             pname = psutil.Process(pid).name()
@@ -430,6 +804,8 @@ class App:
         return True
 
     def execute_checked(self):
+        # Ctrl+S 时先恢复两个目标窗口布局，即使当前没有勾选重载项也执行。
+        self._restore_window_layout()
         checked = [t for t, v in self.check_vars.items() if v.get()]
         if not checked:
             self.status_var.set("没有选中任何项目")
