@@ -30,32 +30,34 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 TRAY_ICON_PATH = os.path.join(RESOURCE_DIR, "icon.ico")
 VK_CONTROL = 0x11
 VK_S = 0x53
-CTRL_S_TRIGGER_DELAY_MS = 500
+CTRL_S_TRIGGER_DELAY_MS = 200
 WM_TRAYICON = win32con.WM_USER + 20
 TRAY_UID = 1
 ID_TRAY_SHOW = 1000
 ID_TRAY_EXIT = 1001
 
 # 未设置自定义记录时使用的默认布局。坐标使用 Windows 虚拟桌面坐标，
-# 当前机器上 DISPLAY2 位于主屏左侧，因此 X 坐标为负数。
+# 当前机器上 DISPLAY1 位于主屏左侧，窗口放在 1 号屏幕右半边。
 DEFAULT_WINDOW_LAYOUT = {
     "m2server": {
-        "screen": r"\\.\DISPLAY2",
+        "screen": r"\\.\DISPLAY1",
         "x": -760,
         "y": 5,
         "width": 754,
         "height": 516,
     },
     "client_console": {
-        "screen": r"\\.\DISPLAY2",
+        "screen": r"\\.\DISPLAY1",
         "x": -765,
         "y": 517,
         "width": 759,
         "height": 519,
     },
 }
-CLIENT_CONSOLE_TITLE = r"E:\龙龙火龙七改\client\game.exe"
-CLIENT_CONSOLE_EXE = os.path.normcase(os.path.normpath(CLIENT_CONSOLE_TITLE))
+# 客户端控制台窗口的判定条件：类名为经典控制台窗口，标题为 exe 完整路径，
+# 只用其中的文件名关键字匹配，避免目录名变化导致找不到窗口。
+CLIENT_CONSOLE_CLASS = "ConsoleWindowClass"
+CLIENT_CONSOLE_TITLE_KEYWORD = "game.exe"
 _app = None
 
 def tray_wnd_proc(hwnd, msg, wparam, lparam):
@@ -398,10 +400,12 @@ class App:
                 ):
                     targets["m2server"] = hwnd
 
+                # 客户端控制台按“窗口类名 + 标题包含 game.exe”判定，
+                # 这样 exe 所在目录变化（client/客户端、版本目录不同）也不会失配。
                 if (
                     targets["client_console"] is None
-                    and title == CLIENT_CONSOLE_TITLE
-                    and self._process_matches(hwnd, "game.exe", CLIENT_CONSOLE_EXE)
+                    and win32gui.GetClassName(hwnd) == CLIENT_CONSOLE_CLASS
+                    and CLIENT_CONSOLE_TITLE_KEYWORD in title.lower()
                 ):
                     targets["client_console"] = hwnd
             except Exception:
