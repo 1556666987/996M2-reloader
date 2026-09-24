@@ -421,24 +421,98 @@ class App:
         return targets
 
     @staticmethod
+    def _all_monitors():
+        monitors = []
+        for monitor_handle, _, _ in win32api.EnumDisplayMonitors():
+            info = win32api.GetMonitorInfo(monitor_handle)
+            rect = info.get("Monitor") or info.get("Work")
+            work = info.get("Work") or info.get("Monitor")
+            if not rect or not work:
+                continue
+            monitors.append({
+                "device": info.get("Device", ""),
+                "monitor": [int(v) for v in rect],
+                "work": [int(v) for v in work],
+                "primary": bool(info.get("Flags", 0) & win32con.MONITORINFOF_PRIMARY),
+            })
+        return monitors
+
+    @staticmethod
+    def _rect_overlap_area(a, b):
+        left = max(a[0], b[0])
+        top = max(a[1], b[1])
+        right = min(a[2], b[2])
+        bottom = min(a[3], b[3])
+        if right <= left or bottom <= top:
+            return 0
+        return (right - left) * (bottom - top)
+
+    def _resolve_monitor(self, geometry):
+        """按“设备名 → 记录的工作区重叠最多 → 主屏”三级顺序定位目标显示器。
+
+        返回 (显示器字典或 None, 提示文本)。提示文本非空时说明发生了降级匹配，
+        调用方应当在状态栏告知用户，而不是静默按绝对坐标摆放。
+        """
+        monitors = self._all_monitors()
+        if not monitors:
+            return None, "未检测到显示器"
+
+        device = geometry.get("screen") or ""
+        for monitor in monitors:
+            if device and monitor["device"] == device:
+                return monitor, ""
+
+        recorded = geometry.get("work")
+        if not isinstance(recorded, (list, tuple)) or len(recorded) != 4:
+            recorded = geometry.get("monitor")
+        if isinstance(recorded, (list, tuple)) and len(recorded) == 4:
+            try:
+                recorded = [int(v) for v in recorded]
+            except (TypeError, ValueError):
+                recorded = None
+            if recorded is not None:
+                best = None
+                best_area = 0
+                for monitor in monitors:
+                    area = self._rect_overlap_area(recorded, monitor["work"])
+                    if area > best_area:
+                        best, best_area = monitor, area
+                if best is not None:
+                    return best, (
+                        f"记录的显示器 {device or '(空)'} 不存在，"
+                        f"已按位置匹配到 {best['device']}"
+                    )
+
+        primary = next((m for m in monitors if m["primary"]), monitors[0])
+        return primary, f"记录的显示器 {device or '(空)'} 不存在，已回退到主屏 {primary['device']}"
+
+    @staticmethod
     def _window_layout_info(hwnd):
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
         monitor_info = win32api.GetMonitorInfo(monitor)
+        work = [int(v) for v in (monitor_info.get("Work") or monitor_info.get("Monitor"))]
+        monitor_rect = [int(v) for v in monitor_info.get("Monitor")]
         return {
             "screen": monitor_info.get("Device", ""),
             "x": int(left),
             "y": int(top),
             "width": int(right - left),
             "height": int(bottom - top),
+            # 设备名在换线、换口、改主屏顺序后会变，多存一份显示器几何信息，
+            # 恢复时就能用“重叠最多”找回原本那块屏。
+            "monitor": monitor_rect,
+            "work": work,
+            # 相对所在显示器工作区左上角的偏移：显示器整体挪位后仍能落回同一相对位置。
+            "offset_x": int(left) - work[0],
+            "offset_y": int(top) - work[1],
         }
 
     @staticmethod
     def _monitor_work_area(device_name):
-        for monitor_handle, _, _ in win32api.EnumDisplayMonitors():
-            info = win32api.GetMonitorInfo(monitor_handle)
-            if info.get("Device") == device_name:
-                return info.get("Work", info.get("Monitor"))
+        for monitor in App._all_monitors():
+            if monitor["device"] == device_name:
+                return tuple(monitor["work"])
         return None
 
     @staticmethod
@@ -576,18 +650,49 @@ class App:
             kernel32.FreeConsole()
 
     def _clamped_window_position(self, geometry):
+        """算出窗口应当摆放的位置，返回 (x, y, width, height, 提示文本)。
+
+        显示器按设备名匹配；匹配不上时用记录的工作区做重叠匹配，再不行才回退主屏，
+        并把降级情况通过提示文本反馈给状态栏。坐标越界、窗口比屏幕大都会在此修正，
+        保证窗口至少完整可见。
+        """
         width = max(1, int(geometry["width"]))
         height = max(1, int(geometry["height"]))
         x = int(geometry["x"])
         y = int(geometry["y"])
-        work_area = self._monitor_work_area(geometry.get("screen", ""))
-        if work_area:
-            left, top, right, bottom = work_area
-            max_x = max(left, right - width)
-            max_y = max(top, bottom - height)
-            x = min(max(x, left), max_x)
-            y = min(max(y, top), max_y)
-        return x, y, width, height
+
+        monitor, note = self._resolve_monitor(geometry)
+        if not monitor:
+            return x, y, width, height, note
+
+        notes = [note] if note else []
+        left, top, right, bottom = monitor["work"]
+        work_width = max(1, right - left)
+        work_height = max(1, bottom - top)
+
+        # 只有在设备名没匹配上（即显示器排列变了）时，才按相对偏移还原；
+        # 设备名匹配成功时以配置里的绝对坐标为准，便于手工微调坐标。
+        if note:
+            offset_x = geometry.get("offset_x")
+            offset_y = geometry.get("offset_y")
+            if isinstance(offset_x, int) and isinstance(offset_y, int):
+                x, y = left + offset_x, top + offset_y
+
+        # 窗口比工作区还大时，夹取会失效（max_x 会小于 left），先收缩到工作区尺寸。
+        if width > work_width:
+            width = work_width
+            notes.append(f"窗口过宽，已收缩到 {work_width}px")
+        if height > work_height:
+            height = work_height
+            notes.append(f"窗口过高，已收缩到 {work_height}px")
+
+        max_x = max(left, right - width)
+        max_y = max(top, bottom - height)
+        clamped_x = min(max(x, left), max_x)
+        clamped_y = min(max(y, top), max_y)
+        if (clamped_x, clamped_y) != (x, y):
+            notes.append("坐标越界，已拉回屏幕内")
+        return clamped_x, clamped_y, width, height, "；".join(notes)
 
     def record_windows(self):
         targets = self._find_target_windows()
@@ -615,14 +720,112 @@ class App:
         else:
             self.status_var.set("窗口布局保存失败，请检查配置文件权限")
 
+    @staticmethod
+    def _primary_monitor():
+        monitors = App._all_monitors()
+        if not monitors:
+            return None
+        return next((m for m in monitors if m["primary"]), monitors[0])
+
+    def _primary_baseline_geometry(self, key, hwnd):
+        """清除记录后写入配置的基准几何：主屏 + (0,0)，尺寸沿用窗口当前尺寸。"""
+        primary = self._primary_monitor()
+        if primary is None:
+            return None
+        work = primary["work"]
+        width = DEFAULT_WINDOW_LAYOUT[key]["width"]
+        height = DEFAULT_WINDOW_LAYOUT[key]["height"]
+        if hwnd and win32gui.IsWindow(hwnd):
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width = max(1, int(right - left))
+            height = max(1, int(bottom - top))
+        return {
+            "screen": primary["device"],
+            "x": 0,
+            "y": 0,
+            "width": width,
+            "height": height,
+            "monitor": list(primary["monitor"]),
+            "work": list(work),
+            "offset_x": 0 - work[0],
+            "offset_y": 0 - work[1],
+        }
+
     def clear_window_record(self):
+        """清除布局记录：配置文件改写为“主屏 +(0,0)”，两个窗口同时移到主屏 (0,0)。
+
+        窗口只移动位置，尺寸保持不变；窗口未找到时仍然写入基准配置，并在状态栏说明。
+        """
+        primary = self._primary_monitor()
+        if primary is None:
+            self.status_var.set("清除窗口布局失败：未检测到显示器")
+            return
+
+        targets = self._find_target_windows(require_visible=False)
+        moved = []
+        missing = []
+        placement_notes = []
+        layout = {}
+
+        for key, label in (("m2server", "M2Server"), ("client_console", "客户端控制台")):
+            hwnd = targets.get(key)
+            if not hwnd:
+                missing.append(label)
+                layout[key] = self._primary_baseline_geometry(key, None)
+                continue
+            try:
+                # 先恢复显示，最小化状态下 GetWindowRect 取到的是 -32000，尺寸不可信。
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                elif not win32gui.IsWindowVisible(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                width = max(1, int(right - left))
+                height = max(1, int(bottom - top))
+                # 主屏 (0,0) 即虚拟桌面原点；尺寸不变，所以不必夹取。
+                self._apply_window_placement(hwnd, 0, 0, width, height)
+                layout[key] = self._primary_baseline_geometry(key, hwnd)
+                moved.append(label)
+            except (OSError, pywintypes.error) as exc:
+                missing.append(label)
+                placement_notes.append(f"{label} 移动失败：{exc}")
+                layout[key] = self._primary_baseline_geometry(key, None)
+
         cfg = load_config()
-        if "window_layout" in cfg:
-            del cfg["window_layout"]
-        if save_config(cfg):
-            self.status_var.set("已清除自定义窗口布局，将使用默认布局")
-        else:
+        cfg["window_layout"] = layout
+        if not save_config(cfg):
             self.status_var.set("清除窗口布局失败，请检查配置文件权限")
+            return
+
+        message = "已清除记录：配置改为主屏 (0,0)"
+        message += "，窗口已移到主屏 (0,0)：" + ("、".join(moved) if moved else "无")
+        if missing:
+            message += "；未找到或移动失败：" + "、".join(missing)
+        if placement_notes:
+            message += "；" + "；".join(placement_notes)
+        self.status_var.set(message)
+
+    # 布局中允许从配置读写的字段。screen/加上坐标尺寸是基础字段，
+    # monitor/work/offset_* 是后加的显示器几何信息，旧配置里没有也要能正常用。
+    LAYOUT_FIELDS = (
+        "screen", "x", "y", "width", "height",
+        "monitor", "work", "offset_x", "offset_y",
+    )
+    LAYOUT_INT_FIELDS = ("x", "y", "width", "height", "offset_x", "offset_y")
+    LAYOUT_RECT_FIELDS = ("monitor", "work")
+
+    @classmethod
+    def _valid_layout_value(cls, field, value):
+        """校验配置里的单个字段，脏数据直接忽略，避免恢复时整项静默失败。"""
+        if field in cls.LAYOUT_INT_FIELDS:
+            return isinstance(value, int) and not isinstance(value, bool)
+        if field in cls.LAYOUT_RECT_FIELDS:
+            return (
+                isinstance(value, (list, tuple))
+                and len(value) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+            )
+        return isinstance(value, str)
 
     def _active_window_layout(self):
         layout = self._copy_default_layout()
@@ -633,16 +836,46 @@ class App:
             value = custom.get(key)
             if not isinstance(value, dict):
                 continue
-            for field in ("screen", "x", "y", "width", "height"):
-                if field in value:
+            for field in self.LAYOUT_FIELDS:
+                if field in value and self._valid_layout_value(field, value[field]):
                     layout[key][field] = value[field]
         return layout
+
+    def _apply_window_placement(self, hwnd, x, y, width, height):
+        """把窗口摆到指定位置和尺寸，并让控制台重新同步缓冲区。"""
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        elif not win32gui.IsWindowVisible(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+        win32gui.SetWindowPos(
+            hwnd,
+            0,
+            x,
+            y,
+            width,
+            height,
+            win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
+        )
+        # WM_SIZE 的 lParam 要求客户区尺寸，而不是包含边框的外框尺寸。
+        # 手动拖动窗口时 Windows 也会按客户区尺寸发送该消息。
+        _, _, client_width, client_height = win32gui.GetClientRect(hwnd)
+        size_lparam = win32api.MAKELONG(client_width, client_height)
+        win32gui.SendMessage(hwnd, win32con.WM_SIZE, win32con.SIZE_RESTORED, size_lparam)
+        win32gui.InvalidateRect(hwnd, None, True)
+        win32gui.UpdateWindow(hwnd)
+        if win32gui.GetClassName(hwnd) == "ConsoleWindowClass":
+            self._sync_console_buffer(hwnd, client_width, client_height)
+            # conhost may recalculate its viewport asynchronously in
+            # response to WM_SIZE. Repeat after that pass and repaint.
+            self.root.after(100, self._resync_console_window, hwnd)
+            self.root.after(300, self._resync_console_window, hwnd)
 
     def _restore_window_layout(self):
         targets = self._find_target_windows(require_visible=False)
         layout = self._active_window_layout()
         restored = []
         missing = []
+        notes = []
         for key, label in (("m2server", "M2Server"), ("client_console", "客户端控制台")):
             hwnd = targets.get(key)
             if not hwnd:
@@ -650,34 +883,11 @@ class App:
                 continue
             geometry = layout[key]
             try:
-                x, y, width, height = self._clamped_window_position(geometry)
-                if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                elif not win32gui.IsWindowVisible(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
-                win32gui.SetWindowPos(
-                    hwnd,
-                    0,
-                    x,
-                    y,
-                    width,
-                    height,
-                    win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
-                )
-                # WM_SIZE 的 lParam 要求客户区尺寸，而不是包含边框的外框尺寸。
-                # 手动拖动窗口时 Windows 也会按客户区尺寸发送该消息。
-                _, _, client_width, client_height = win32gui.GetClientRect(hwnd)
-                size_lparam = win32api.MAKELONG(client_width, client_height)
-                win32gui.SendMessage(hwnd, win32con.WM_SIZE, win32con.SIZE_RESTORED, size_lparam)
-                win32gui.InvalidateRect(hwnd, None, True)
-                win32gui.UpdateWindow(hwnd)
-                if win32gui.GetClassName(hwnd) == "ConsoleWindowClass":
-                    self._sync_console_buffer(hwnd, client_width, client_height)
-                    # conhost may recalculate its viewport asynchronously in
-                    # response to WM_SIZE. Repeat after that pass and repaint.
-                    self.root.after(100, self._resync_console_window, hwnd)
-                    self.root.after(300, self._resync_console_window, hwnd)
+                x, y, width, height, note = self._clamped_window_position(geometry)
+                self._apply_window_placement(hwnd, x, y, width, height)
                 restored.append(label)
+                if note:
+                    notes.append(f"{label}：{note}")
             except (KeyError, TypeError, ValueError, OSError):
                 missing.append(label)
 
@@ -685,9 +895,13 @@ class App:
             self.status_var.set(
                 "窗口布局：已调整 " + ("、".join(restored) if restored else "无")
                 + "；未找到或调整失败：" + "、".join(missing)
+                + ("；" + "；".join(notes) if notes else "")
             )
         elif restored:
-            self.status_var.set("窗口布局已恢复：" + "、".join(restored))
+            message = "窗口布局已恢复：" + "、".join(restored)
+            if notes:
+                message += "；" + "；".join(notes)
+            self.status_var.set(message)
         return targets
 
     def _resync_console_window(self, hwnd):
